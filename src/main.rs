@@ -1,20 +1,28 @@
-use std::str::FromStr;
+use crate::utils::{build_ctx, load_keypairs, load_keys, load_transfer_targets};
+use namada_sdk::borsh::BorshDeserialize;
 use namada_sdk::{
-    address::Address, args::{InputAmount, TxBuilder, TxTransparentTransferData}, io::NullIo, key::common::SecretKey, masp::fs::FsShieldedUtils, rpc, signing::default_sign, tx::ProcessTxResponse, wallet::fs::FsWalletUtils, Namada, NamadaImpl
+    Namada, NamadaImpl,
+    address::Address,
+    args::{InputAmount, TxBuilder, TxTransparentTransferData},
+    io::NullIo,
+    masp::fs::FsShieldedUtils,
+    rpc,
+    signing::default_sign,
+    tx::ProcessTxResponse,
+    wallet::fs::FsWalletUtils,
 };
 use namada_token::Transfer;
-use utils::{GAS_LIMIT, KEYPAIRS, NATIVE_TOKEN};
-use crate::utils::{build_ctx, load_keys, load_transfer_targets};
 use serde::Deserialize;
+use std::str::FromStr;
 use tendermint_rpc::HttpClient;
-use namada_sdk::borsh::BorshDeserialize;
+use utils::{GAS_LIMIT, NATIVE_TOKEN};
 
 pub mod utils;
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TransferTarget {
-    address: &'static str,
-    amount: u64,
+    pub address: String,
+    pub amount: u64,
 }
 
 async fn build_transfer_data(
@@ -46,22 +54,104 @@ async fn main() {
     let sdk = build_ctx().await;
 
     // Wallet things
-    load_keys(&sdk, &KEYPAIRS).await;
+    let keypairs = load_keypairs();
+    load_keys(&sdk, &keypairs).await;
 
     let transfer_targets = load_transfer_targets();
 
     let native_token = Address::from_str(NATIVE_TOKEN).unwrap();
     let pubkey_0 = sdk.wallet().await.find_public_key("key-0").unwrap();
-    let pubkey_1 = sdk.wallet().await.find_public_key("key-1").unwrap();
 
     let token = native_token;
 
+    // Get all source public keys for signing
+    let mut signing_keys = Vec::new();
+    for idx in 0..keypairs.len() {
+        let key_name = format!("key-{}", idx);
+        let pubkey = sdk.wallet().await.find_public_key(&key_name).unwrap();
+        signing_keys.push(pubkey);
+    }
+
+    // Check if each source's public key has been revealed on chain
+    println!("\nChecking if source public keys are revealed on chain:");
+    let mut unrevealed_addresses = Vec::new();
+    for (idx, keypair) in keypairs.iter().enumerate() {
+        let address = Address::from_str(&keypair.address).unwrap();
+        match rpc::is_public_key_revealed(&sdk.client, &address).await {
+            Ok(is_revealed) => {
+                println!(
+                    "Source {} ({}): {}",
+                    idx,
+                    keypair.address,
+                    if is_revealed {
+                        "REVEALED"
+                    } else {
+                        "NOT REVEALED"
+                    }
+                );
+                if !is_revealed {
+                    unrevealed_addresses.push((idx, address));
+                }
+            }
+            Err(e) => {
+                println!(
+                    "Source {} ({}): Error checking reveal status - {}",
+                    idx, keypair.address, e
+                );
+            }
+        }
+    }
+    println!(); // Add a blank line for readability
+
+    // Handle unrevealed public keys one by one
+    if !unrevealed_addresses.is_empty() {
+        println!(
+            "Found {} addresses with unrevealed public keys:",
+            unrevealed_addresses.len()
+        );
+        for (idx, addr) in &unrevealed_addresses {
+            println!("\nRevealing source {} ({}):", idx, addr);
+            let key_name = format!("key-{}", idx);
+            let key_to_reveal = sdk.wallet().await.find_public_key(&key_name).unwrap();
+            // Build the reveal pk transaction
+            let reveal_tx_builder = sdk
+                .new_reveal_pk(key_to_reveal)
+                .signing_keys(vec![pubkey_0.clone()]);
+            let (mut reveal_tx, signing_data) = reveal_tx_builder
+                .build(&sdk)
+                .await
+                .expect("unable to build reveal pk tx");
+
+            // Sign the transaction
+            sdk.sign(
+                &mut reveal_tx,
+                &reveal_tx_builder.tx,
+                signing_data,
+                default_sign,
+                (),
+            )
+            .await
+            .expect("unable to sign reveal pk tx");
+
+            // Submit the signed tx to the ledger for execution
+            // Assumes account already has funds to cover gas costs
+            match sdk.submit(reveal_tx.clone(), &reveal_tx_builder.tx).await {
+                Ok(res) => println!("Tx result: {:?}", res),
+                Err(e) => println!("Tx error: {:?}", e),
+            }
+        }
+        println!("\nAll reveal transactions processed. Proceeding with transfers...");
+    }
+
     let mut data = Vec::new();
 
-    // Define the transfers in the batch
-    data.push(build_transfer_data(&sdk, "key-0", transfer_targets[0].address, &token, 1).await);
-    data.push(build_transfer_data(&sdk, "key-0", transfer_targets[1].address, &token, 2).await);
-    data.push(build_transfer_data(&sdk, "key-1", transfer_targets[2].address, &token, 2).await);
+    // Create transfers by pairing each source key with its corresponding target
+    for (idx, target) in transfer_targets.iter().enumerate() {
+        let source_key = format!("key-{}", idx);
+        data.push(
+            build_transfer_data(&sdk, &source_key, &target.address, &token, target.amount).await,
+        );
+    }
     println!("{:#?}", data);
 
     // Build the tx
@@ -69,8 +159,8 @@ async fn main() {
         .new_transparent_transfer(data.clone())
         // .dry_run(true) // Uncomment for dry-run mode
         // .gas_limit(gas_limit.into()) // Uncomment if you want to set a different gas limit
-        .signing_keys(vec![pubkey_0.clone(), pubkey_1.clone()]);
-        
+        .signing_keys(signing_keys);
+
     let (mut transfer_tx, signing_data) = transfer_tx_builder
         .build(&sdk)
         .await
@@ -94,7 +184,10 @@ async fn main() {
     .expect("unable to sign transparent-transfer tx");
 
     // Submit the tx
-    match sdk.submit(transfer_tx.clone(), &transfer_tx_builder.tx).await {
+    match sdk
+        .submit(transfer_tx.clone(), &transfer_tx_builder.tx)
+        .await
+    {
         Ok(res) => {
             println!("Tx result: {:?}", res);
             if let ProcessTxResponse::Applied(applied) = res {
@@ -104,7 +197,7 @@ async fn main() {
         }
         Err(e) => println!("\n\nTx error: {:?}\n\n", e),
     }
-    
+
     // Print some results out
     // for target in transfer_targets {
     //     let target = Address::from_str(&target.address).unwrap();
