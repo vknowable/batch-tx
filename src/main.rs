@@ -147,7 +147,7 @@ async fn main() {
 
     // Create transfers by pairing each source key with its corresponding target
     for (idx, target) in transfer_targets.iter().enumerate() {
-        let source_key = format!("key-{}", idx);
+        let source_key = format!("key-{}", idx % keypairs.iter().count());
         data.push(
             build_transfer_data(&sdk, &source_key, &target.address, &token, target.amount).await,
         );
@@ -158,7 +158,7 @@ async fn main() {
     let mut transfer_tx_builder = sdk
         .new_transparent_transfer(data.clone())
         // .dry_run(true) // Uncomment for dry-run mode
-        // .gas_limit(gas_limit.into()) // Uncomment if you want to set a different gas limit
+        // .gas_limit(GAS_LIMIT.into()) // Uncomment if you want to set a different gas limit
         .signing_keys(signing_keys);
 
     let (mut transfer_tx, signing_data) = transfer_tx_builder
